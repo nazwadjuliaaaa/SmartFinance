@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: smartfinance-demo
+    env: php
+    region: singapore
+    plan: free
+    buildCommand: composer install --no-dev --optimize-autoloader && php artisan key:generate --force && php artisan migrate --force && npm install && npm run build
+    startCommand: heroku-php-apache2 public/
+    envVars:
+      - key: APP_NAME
+        value: SmartFinance
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: true
+      - key: APP_KEY
+        value: base64:TpjXzWU21rPdhzcXs+sUVEVvzlgGt45zosjnpfbz9ug=
