@@ -3,57 +3,79 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
-
-
+use App\Services\SupabaseService;
+use Illuminate\Support\Facades\Hash;
+use Carbon\Carbon;
 
 class FinanceController extends Controller
 {
+    protected SupabaseService $supabase;
+
+    public function __construct(SupabaseService $supabase)
+    {
+        $this->supabase = $supabase;
+    }
+
     public function index()
     {
         $userId = auth()->id();
-        $initial = \App\Models\FinancialInitial::where('user_id', $userId)->latest()->first();
-        $startingCapital = $initial ? $initial->starting_capital : 0;
         
-        $revenue = \App\Models\FinancialRecord::where('user_id', $userId)->where('type', 'in')->sum('amount');
-        $expense = \App\Models\FinancialRecord::where('user_id', $userId)->where('type', 'out')->sum('amount');
+        // Initial data
+        $initials = $this->supabase->select('financial_initials', ['*'], ['user_id' => "eq.{$userId}"], 1);
+        $initial = null;
+        $startingCapital = 0;
         
-        // Stats
+        if (!empty($initials)) {
+            $initial = (object) $initials[0];
+            $startingCapital = (float)$initial->starting_capital;
+        }
+        
+        // Get ALL income records with dates for aggregation
+        $incomeRecords = $this->supabase->select('financial_records', ['amount', 'transaction_date'], ['user_id' => "eq.{$userId}", 'type' => 'eq.in']);
+        $expenseRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.out']);
+        
+        $revenue = array_sum(array_column($incomeRecords, 'amount'));
+        $expense = array_sum(array_column($expenseRecords, 'amount'));
+        
         $omzet = $revenue;
-        $in = $startingCapital + $revenue; 
+        $in = $startingCapital + $revenue;
         $out = $expense;
 
-        // 1. Sales Trend (Last 6 Months) - reusing logic
+        // Chart data - aggregate by month
         $months = [];
         $salesData = [];
-        $profitData = []; // Estimated 40%
-
+        $profitData = [];
+        
         for ($i = 5; $i >= 0; $i--) {
-            $date = \Carbon\Carbon::now()->subMonths($i);
-            $monthName = $date->translatedFormat('M');
+            $date = Carbon::now()->subMonths($i);
+            $months[] = $date->translatedFormat('M');
             $year = $date->year;
             $month = $date->month;
             
-            $months[] = $monthName;
-
-            $monthlyRevenue = \App\Models\FinancialRecord::where('user_id', $userId)
-                ->where('type', 'in')
-                ->whereYear('transaction_date', $year)
-                ->whereMonth('transaction_date', $month)
-                ->sum('amount');
-                
-            $salesData[] = $monthlyRevenue;
-            $profitData[] = $monthlyRevenue * 0.4;
+            // Filter income records for this month
+            $monthlyTotal = 0;
+            foreach ($incomeRecords as $r) {
+                $txDate = Carbon::parse($r['transaction_date']);
+                if ($txDate->year == $year && $txDate->month == $month) {
+                    $monthlyTotal += $r['amount'];
+                }
+            }
+            
+            $salesData[] = $monthlyTotal;
+            $profitData[] = $monthlyTotal * 0.4; // Estimated 40% profit margin
         }
 
-        // 2. Insight: Today's Achievement
-        $todayRevenue = \App\Models\FinancialRecord::where('user_id', $userId)
-            ->where('type', 'in')
-            ->whereDate('transaction_date', \Carbon\Carbon::today())
-            ->sum('amount');
-            
-        $dailyTarget = 1000000; // Example Target: 1 Million IDR
-        $achievementPct = ($todayRevenue / $dailyTarget) * 100;
-        if ($achievementPct > 100) $achievementPct = 100;
+        // Today's revenue for doughnut chart
+        $todayRevenue = 0;
+        $today = Carbon::today()->format('Y-m-d');
+        foreach ($incomeRecords as $r) {
+            if (Carbon::parse($r['transaction_date'])->format('Y-m-d') === $today) {
+                $todayRevenue += $r['amount'];
+            }
+        }
+        
+        $dailyTarget = 1000000;
+        $achievementPct = ($dailyTarget > 0) ? min(100, ($todayRevenue / $dailyTarget) * 100) : 0;
         $remainingPct = 100 - $achievementPct;
 
         return view('dashboard', compact(
@@ -66,23 +88,26 @@ class FinanceController extends Controller
     public function showInitialInput()
     {
         $userId = auth()->id();
-        $initial = \App\Models\FinancialInitial::where('user_id', $userId)->latest()->first();
+        $initials = $this->supabase->select('financial_initials', ['*'], ['user_id' => "eq.{$userId}"], 1);
+        $initial = $initials[0] ?? null;
+        
+        // Convert array to object for blade compatibility
+        if ($initial) {
+            $initial = (object) $initial;
+            $initial->fixed_assets = is_string($initial->fixed_assets) ? json_decode($initial->fixed_assets, true) : $initial->fixed_assets;
+            $initial->raw_materials = is_string($initial->raw_materials) ? json_decode($initial->raw_materials, true) : $initial->raw_materials;
+        }
+        
         return view('input_data_awal', compact('initial'));
     }
 
     public function storeInitialInput(Request $request)
     {
-        // Sanitize Input (Remove dots from thousands separator)
         if ($request->capital_cash) {
-            $request->merge([
-                'capital_cash' => str_replace('.', '', $request->capital_cash)
-            ]);
+            $request->merge(['capital_cash' => str_replace('.', '', $request->capital_cash)]);
         }
-        
         if ($request->liabilities) {
-            $request->merge([
-                'liabilities' => str_replace('.', '', $request->liabilities)
-            ]);
+            $request->merge(['liabilities' => str_replace('.', '', $request->liabilities)]);
         }
 
         $request->validate([
@@ -95,29 +120,28 @@ class FinanceController extends Controller
 
         $capital = ($request->capital_cash ?? 0) + ($request->capital_bank ?? 0);
 
-        $initial = \App\Models\FinancialInitial::create([
+        $this->supabase->insert('financial_initials', [
             'user_id' => auth()->id(),
             'starting_capital' => $capital,
-            'fixed_assets' => json_decode($request->assets_json),
-            'raw_materials' => json_decode($request->materials_json),
+            'fixed_assets' => $request->assets_json,
+            'raw_materials' => $request->materials_json,
             'initial_liabilities' => $request->liabilities,
         ]);
 
-        // Automatically sync Fixed Assets to Products for Sales Dropdown
-        // Automatically sync Goods (from 'Barang yang Dijual') to Products for Sales Dropdown
+        // Sync products
         if ($request->materials_json) {
             $goods = json_decode($request->materials_json, true);
             foreach ($goods as $good) {
-                // Check if product already exists to avoid duplicates (optional, but good practice)
-                $exists = \App\Models\Product::where('user_id', auth()->id())
-                            ->where('name', $good['name'])
-                            ->exists();
+                $existing = $this->supabase->select('products', ['id'], [
+                    'user_id' => "eq." . auth()->id(),
+                    'name' => "eq." . $good['name']
+                ], 1);
                 
-                if (!$exists) {
-                    \App\Models\Product::create([
+                if (empty($existing)) {
+                    $this->supabase->insert('products', [
                         'user_id' => auth()->id(),
                         'name' => $good['name'],
-                        'price' => $good['price'] ?? 0, 
+                        'price' => $good['price'] ?? 0,
                     ]);
                 }
             }
@@ -129,38 +153,21 @@ class FinanceController extends Controller
     public function showRecap()
     {
         $userId = auth()->id();
-        $initial = \App\Models\FinancialInitial::where('user_id', $userId)->latest()->first();
+        $initials = $this->supabase->select('financial_initials', ['*'], ['user_id' => "eq.{$userId}"], 1);
+        $initial = $initials[0] ?? null;
+        if ($initial) $initial = (object) $initial;
         
-        // 1. Financial Summary Data Only
-        $startingCapital = $initial ? $initial->starting_capital : 0;
-        $allRevenue = \App\Models\FinancialRecord::where('user_id', $userId)->where('type', 'in')->sum('amount');
-        $allExpense = \App\Models\FinancialRecord::where('user_id', $userId)->where('type', 'out')->sum('amount');
+        $startingCapital = $initial ? (float)$initial->starting_capital : 0;
+        
+        $incomeRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.in']);
+        $expenseRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.out']);
+        
+        $allRevenue = array_sum(array_column($incomeRecords, 'amount'));
+        $allExpense = array_sum(array_column($expenseRecords, 'amount'));
         
         $totalBalance = $startingCapital + $allRevenue - $allExpense;
-
-        // Growth Percentage
-        $thisMonthRevenue = \App\Models\FinancialRecord::where('user_id', $userId)
-            ->where('type', 'in')
-            ->whereMonth('transaction_date', now()->month)
-            ->whereYear('transaction_date', now()->year)
-            ->sum('amount');
-
-        $lastMonthRevenue = \App\Models\FinancialRecord::where('user_id', $userId)
-            ->where('type', 'in')
-            ->whereMonth('transaction_date', now()->subMonth()->month)
-            ->whereYear('transaction_date', now()->subMonth()->year)
-            ->sum('amount');
-            
         $growthPct = 0;
-        if ($lastMonthRevenue > 0) {
-            $growthPct = (($thisMonthRevenue - $lastMonthRevenue) / $lastMonthRevenue) * 100;
-        } elseif ($thisMonthRevenue > 0) {
-            $growthPct = 100; 
-        }
-
-        // Daily Avg
-        $daysPassed = now()->day;
-        $dailyAvg = $daysPassed > 0 ? $thisMonthRevenue / $daysPassed : 0;
+        $dailyAvg = 0;
 
         return view('recap_data', compact('initial', 'totalBalance', 'growthPct', 'dailyAvg'));
     }
@@ -168,11 +175,16 @@ class FinanceController extends Controller
     public function reportPnL()
     {
         $userId = auth()->id();
-        $initial = \App\Models\FinancialInitial::where('user_id', $userId)->latest()->first();
+        $initials = $this->supabase->select('financial_initials', ['*'], ['user_id' => "eq.{$userId}"], 1);
+        $initial = $initials[0] ?? null;
+        if ($initial) $initial = (object) $initial;
         
-        $grossRevenue = \App\Models\FinancialRecord::where('user_id', $userId)->where('type', 'in')->sum('amount');
-        $cogs = \App\Models\FinancialRecord::where('user_id', $userId)->where('type', 'out')->sum('amount');
-        $opex = 0; 
+        $incomeRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.in']);
+        $expenseRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.out']);
+        
+        $grossRevenue = array_sum(array_column($incomeRecords, 'amount'));
+        $cogs = array_sum(array_column($expenseRecords, 'amount'));
+        $opex = 0;
         $netProfit = $grossRevenue - $cogs - $opex;
 
         return view('finance.report.pnl', compact('initial', 'grossRevenue', 'cogs', 'opex', 'netProfit'));
@@ -181,11 +193,18 @@ class FinanceController extends Controller
     public function reportLog()
     {
         $userId = auth()->id();
-        $initial = \App\Models\FinancialInitial::where('user_id', $userId)->latest()->first();
+        $initials = $this->supabase->select('financial_initials', ['*'], ['user_id' => "eq.{$userId}"], 1);
+        $initial = $initials[0] ?? null;
+        if ($initial) $initial = (object) $initial;
         
-        $transactions = \App\Models\FinancialRecord::where('user_id', $userId)
-            ->latest('transaction_date')
-            ->paginate(10);
+        $records = $this->supabase->select('financial_records', ['*'], ['user_id' => "eq.{$userId}"]);
+        
+        // Convert to collection-like for blade
+        $transactions = collect($records)->map(function($r) {
+            $obj = (object) $r;
+            $obj->transaction_date = Carbon::parse($r['transaction_date']);
+            return $obj;
+        })->sortByDesc('transaction_date');
 
         return view('finance.report.log', compact('initial', 'transactions'));
     }
@@ -193,24 +212,76 @@ class FinanceController extends Controller
     public function reportInsight()
     {
         $userId = auth()->id();
-        $initial = \App\Models\FinancialInitial::where('user_id', $userId)->latest()->first();
+        $initials = $this->supabase->select('financial_initials', ['*'], ['user_id' => "eq.{$userId}"], 1);
+        $initial = $initials[0] ?? null;
+        if ($initial) $initial = (object) $initial;
         
-        $topProducts = \App\Models\SaleItem::whereHas('financialRecord', function($q) use ($userId) {
-                $q->where('user_id', $userId)->where('type', 'in');
-            })
-            ->with('product')
-            ->selectRaw('product_id, sum(quantity) as total_qty')
-            ->groupBy('product_id')
-            ->orderByDesc('total_qty')
-            ->take(5)
-            ->get();
+        // Get income records for this user
+        $incomeRecords = $this->supabase->select('financial_records', ['id'], ['user_id' => "eq.{$userId}", 'type' => 'eq.in']);
+        
+        // Aggregate Top Products
+        $topProducts = collect([]);
+        if (!empty($incomeRecords)) {
+            $recordIds = array_column($incomeRecords, 'id');
             
-        $busiestDays = \App\Models\FinancialRecord::where('user_id', $userId)
-            ->where('type', 'in')
-            ->selectRaw('DAYNAME(transaction_date) as day_name, COUNT(*) as count')
-            ->groupBy('day_name')
-            ->orderByDesc('count')
-            ->get();
+            // Get sale items for these records
+            $allSaleItems = [];
+            foreach ($recordIds as $rid) {
+                $items = $this->supabase->select('sale_items', ['product_id', 'quantity'], ['financial_record_id' => "eq.{$rid}"]);
+                $allSaleItems = array_merge($allSaleItems, $items);
+            }
+            
+            // Group by product_id
+            $grouped = [];
+            foreach ($allSaleItems as $si) {
+                $pid = $si['product_id'];
+                if (!isset($grouped[$pid])) {
+                    $grouped[$pid] = ['product_id' => $pid, 'total_qty' => 0];
+                }
+                $grouped[$pid]['total_qty'] += $si['quantity'];
+            }
+            
+            // Get product names and create objects
+            $topProductItems = [];
+            foreach ($grouped as $pid => $data) {
+                $products = $this->supabase->select('products', ['name'], ['id' => "eq.{$pid}"], 1);
+                $productName = $products[0]['name'] ?? 'Unknown';
+                
+                $item = new \stdClass();
+                $item->product = (object) ['name' => $productName];
+                $item->total_qty = $data['total_qty'];
+                $topProductItems[] = $item;
+            }
+            
+            // Sort and take top 5
+            usort($topProductItems, fn($a, $b) => $b->total_qty <=> $a->total_qty);
+            $topProducts = collect(array_slice($topProductItems, 0, 5));
+        }
+        
+        // Aggregate Busiest Days
+        $busiestDays = collect([]);
+        $allRecords = $this->supabase->select('financial_records', ['transaction_date'], ['user_id' => "eq.{$userId}", 'type' => 'eq.in']);
+        
+        if (!empty($allRecords)) {
+            $dayCounts = [];
+            foreach ($allRecords as $r) {
+                $dayName = Carbon::parse($r['transaction_date'])->translatedFormat('l'); // Full day name
+                if (!isset($dayCounts[$dayName])) {
+                    $dayCounts[$dayName] = 0;
+                }
+                $dayCounts[$dayName]++;
+            }
+            
+            // Sort by count
+            arsort($dayCounts);
+            
+            foreach ($dayCounts as $dayName => $count) {
+                $item = new \stdClass();
+                $item->day_name = $dayName;
+                $item->count = $count;
+                $busiestDays->push($item);
+            }
+        }
 
         return view('finance.report.insight', compact('initial', 'topProducts', 'busiestDays'));
     }
@@ -218,25 +289,31 @@ class FinanceController extends Controller
     // Cash In Features
     public function cashInIndex()
     {
-        $transactions = \App\Models\FinancialRecord::where('user_id', auth()->id())
-            ->where('type', 'in')
-            ->latest('transaction_date')
-            ->get();
+        $userId = auth()->id();
+        $records = $this->supabase->select('financial_records', ['*'], ['user_id' => "eq.{$userId}", 'type' => 'eq.in']);
+        
+        $transactions = collect($records)->map(function($r) {
+            $obj = (object) $r;
+            $obj->transaction_date = Carbon::parse($r['transaction_date']);
+            return $obj;
+        })->sortByDesc('transaction_date');
+
         return view('kas_masuk', compact('transactions'));
     }
 
     public function cashInCreate()
     {
-        $products = \App\Models\Product::where('user_id', auth()->id())->get();
-        // Dummy data seeding removed as per request
+        $userId = auth()->id();
+        $productsList = $this->supabase->select('products', ['*'], ['user_id' => "eq.{$userId}"]);
+        $products = collect($productsList)->map(fn($p) => (object) $p);
+        
         return view('tambah_pemasukan', compact('products'));
     }
 
     public function cashInStore(Request $request)
     {
-        // Sanitize Input (Remove dots from thousands separator)
-        $cleanCash = str_replace('.', '', $request->amount_cash);
-        $cleanNonCash = str_replace('.', '', $request->amount_non_cash);
+        $cleanCash = str_replace('.', '', $request->amount_cash ?? '0');
+        $cleanNonCash = str_replace('.', '', $request->amount_non_cash ?? '0');
 
         $request->merge([
             'amount_cash' => $cleanCash,
@@ -247,15 +324,13 @@ class FinanceController extends Controller
             'date' => 'required|date',
             'amount_cash' => 'nullable|numeric',
             'amount_non_cash' => 'nullable|numeric',
-            'items' => 'nullable|array' // array of {product_id, quantity}
         ]);
 
         $cash = $request->amount_cash ?? 0;
         $nonCash = $request->amount_non_cash ?? 0;
         $total = $cash + $nonCash;
 
-        // Create record
-        $record = \App\Models\FinancialRecord::create([
+        $record = $this->supabase->insert('financial_records', [
             'user_id' => auth()->id(),
             'type' => 'in',
             'amount' => $total,
@@ -265,13 +340,11 @@ class FinanceController extends Controller
             'description' => 'Penjualan'
         ]);
 
-        // Process items if split payment not used or just to log details
-        // Note: The screenshot shows a "Tambah" button list logic. For simplicity, if we receive items array:
-        if($request->has('items_json')) {
+        if ($request->has('items_json') && $record) {
             $items = json_decode($request->items_json, true);
-            foreach($items as $item) {
-                \App\Models\SaleItem::create([
-                    'financial_record_id' => $record->id,
+            foreach ($items as $item) {
+                $this->supabase->insert('sale_items', [
+                    'financial_record_id' => $record['id'],
                     'product_id' => $item['id'],
                     'quantity' => $item['qty'],
                     'total_price' => $item['total']
@@ -284,23 +357,28 @@ class FinanceController extends Controller
 
     public function cashInEdit($id)
     {
-        $record = \App\Models\FinancialRecord::where('user_id', auth()->id())->findOrFail($id);
-        $products = \App\Models\Product::where('user_id', auth()->id())->get();
-        // Assume single item editing for now as per previous simple logic, or load items
-        // For simple edit, we just allow editing total amount and date if it wasn't itemized detailedly in UI
-        // But since we have items, we should ideally load them. 
-        // For MVP speed, let's allow editing the main Record details.
+        $userId = auth()->id();
+        $records = $this->supabase->select('financial_records', ['*'], ['id' => "eq.{$id}", 'user_id' => "eq.{$userId}"], 1);
         
+        if (empty($records)) {
+            abort(404);
+        }
+        
+        $record = (object) $records[0];
+        $record->transaction_date = Carbon::parse($record->transaction_date);
+        
+        $productsList = $this->supabase->select('products', ['*'], ['user_id' => "eq.{$userId}"]);
+        $products = collect($productsList)->map(fn($p) => (object) $p);
+
         return view('edit_pemasukan', compact('record', 'products'));
     }
 
     public function cashInUpdate(Request $request, $id)
     {
-        $record = \App\Models\FinancialRecord::where('user_id', auth()->id())->findOrFail($id);
-
-        // Sanitize
-        $cleanCash = str_replace('.', '', $request->amount_cash);
-        $cleanNonCash = str_replace('.', '', $request->amount_non_cash);
+        $userId = auth()->id();
+        
+        $cleanCash = str_replace('.', '', $request->amount_cash ?? '0');
+        $cleanNonCash = str_replace('.', '', $request->amount_non_cash ?? '0');
 
         $request->merge([
             'amount_cash' => $cleanCash,
@@ -317,27 +395,22 @@ class FinanceController extends Controller
         $nonCash = $request->amount_non_cash ?? 0;
         $total = $cash + $nonCash;
 
-        $record->update([
+        $this->supabase->update('financial_records', [
             'transaction_date' => $request->date,
             'amount' => $total,
             'cash_amount' => $cash,
             'non_cash_amount' => $nonCash,
-        ]);
+        ], ['id' => "eq.{$id}", 'user_id' => "eq.{$userId}"]);
 
-        // Note: Updating specific items is complex in this UI flow. 
-        // If users want to change items, they might need to delete and re-add or we build a complex JS edit.
-        // For now, updating the total allows fixing mistakes.
-        
         return redirect()->route('finance.cash-in.index')->with('success', 'Data berhasil diperbarui');
     }
 
     public function cashInDestroy($id)
     {
-        $record = \App\Models\FinancialRecord::where('user_id', auth()->id())->findOrFail($id);
+        $userId = auth()->id();
         
-        // Items will auto-delete if cascade on delete is set in DB, else:
-        \App\Models\SaleItem::where('financial_record_id', $record->id)->delete();
-        $record->delete();
+        $this->supabase->delete('sale_items', ['financial_record_id' => "eq.{$id}"]);
+        $this->supabase->delete('financial_records', ['id' => "eq.{$id}", 'user_id' => "eq.{$userId}"]);
 
         return redirect()->route('finance.cash-in.index')->with('success', 'Data berhasil dihapus');
     }
@@ -345,87 +418,108 @@ class FinanceController extends Controller
     public function salesAnalysis()
     {
         $userId = auth()->id();
+        
+        // Get income records with dates
+        $incomeRecords = $this->supabase->select('financial_records', ['id', 'amount', 'transaction_date'], ['user_id' => "eq.{$userId}", 'type' => 'eq.in']);
+        $totalRevenue = array_sum(array_column($incomeRecords, 'amount'));
+        $profit = $totalRevenue * 0.4;
 
-        // 1. Totals
-        $records = \App\Models\FinancialRecord::where('user_id', $userId)->where('type', 'in')->get();
-        $totalRevenue = $records->sum('amount');
-        $profit = $totalRevenue * 0.4; // Estimated 40% margin
-
-        // 2. Trend Chart (Last 6 Months)
-        $trendData = [];
+        // Monthly aggregation
         $months = [];
         $revenueData = [];
         $profitData = [];
-
+        
         for ($i = 5; $i >= 0; $i--) {
             $date = now()->subMonths($i);
-            $monthName = $date->format('M');
-            $year = $date->format('Y');
+            $months[] = $date->format('M');
+            $year = $date->year;
+            $month = $date->month;
             
-            // Sum revenue for this month
-            // Note: simple query inside loop for 6 items is acceptable for this scale
-            $monthRevenue = \App\Models\FinancialRecord::where('user_id', $userId)
-                ->where('type', 'in')
-                ->whereYear('transaction_date', $year)
-                ->whereMonth('transaction_date', $date->month)
-                ->sum('amount');
+            $monthlyTotal = 0;
+            foreach ($incomeRecords as $r) {
+                $txDate = Carbon::parse($r['transaction_date']);
+                if ($txDate->year == $year && $txDate->month == $month) {
+                    $monthlyTotal += $r['amount'];
+                }
+            }
             
-            $months[] = $monthName;
-            $revenueData[] = $monthRevenue;
-            $profitData[] = $monthRevenue * 0.4; // Consistent 40% estimation
+            $revenueData[] = $monthlyTotal;
+            $profitData[] = $monthlyTotal * 0.4;
         }
 
-        // 3. Top 5 Products
-        // Join SaleItem with FinancialRecord to filter only 'in' (sales)
-        $topProducts = \App\Models\SaleItem::whereHas('financialRecord', function($q) use ($userId) {
-                $q->where('user_id', $userId)->where('type', 'in');
-            })
-            ->with('product')
-            ->selectRaw('product_id, sum(quantity) as total_qty')
-            ->groupBy('product_id')
-            ->orderByDesc('total_qty')
-            ->take(5)
-            ->get();
-
-        $topProductLabels = $topProducts->map(fn($item) => $item->product->name ?? 'Unknown');
-        $topProductData = $topProducts->pluck('total_qty');
+        // Top Products from sale_items
+        $topProductLabels = collect([]);
+        $topProductData = collect([]);
+        
+        if (!empty($incomeRecords)) {
+            $recordIds = array_column($incomeRecords, 'id');
+            $allSaleItems = [];
+            
+            foreach ($recordIds as $rid) {
+                $items = $this->supabase->select('sale_items', ['product_id', 'quantity'], ['financial_record_id' => "eq.{$rid}"]);
+                $allSaleItems = array_merge($allSaleItems, $items);
+            }
+            
+            // Group by product_id
+            $grouped = [];
+            foreach ($allSaleItems as $si) {
+                $pid = $si['product_id'];
+                if (!isset($grouped[$pid])) {
+                    $grouped[$pid] = ['product_id' => $pid, 'qty' => 0];
+                }
+                $grouped[$pid]['qty'] += $si['quantity'];
+            }
+            
+            // Sort and take top 5
+            usort($grouped, fn($a, $b) => $b['qty'] <=> $a['qty']);
+            $top5 = array_slice($grouped, 0, 5);
+            
+            foreach ($top5 as $item) {
+                $products = $this->supabase->select('products', ['name'], ['id' => "eq.{$item['product_id']}"], 1);
+                $topProductLabels->push($products[0]['name'] ?? 'Unknown');
+                $topProductData->push($item['qty']);
+            }
+        }
 
         return view('analisis_pemasukan', compact(
-            'totalRevenue', 
-            'profit', 
-            'months', 
-            'revenueData', 
-            'profitData',
-            'topProductLabels',
-            'topProductData'
+            'totalRevenue', 'profit', 'months', 'revenueData', 'profitData',
+            'topProductLabels', 'topProductData'
         ));
     }
 
     // Cash Out Features
     public function cashOutIndex()
     {
-        $items = \App\Models\SaleItem::whereHas('financialRecord', function($q) {
-                $q->where('user_id', auth()->id())->where('type', 'out');
-            })
-            ->with(['financialRecord', 'product'])
-            ->get()
-            ->sortByDesc(function($item) {
-                return $item->financialRecord->transaction_date;
-            });
+        $userId = auth()->id();
+        
+        // Get expense records
+        $records = $this->supabase->select('financial_records', ['*'], ['user_id' => "eq.{$userId}", 'type' => 'eq.out']);
+        
+        // Get all sale items for those records
+        $items = collect([]);
+        foreach ($records as $record) {
+            $saleItems = $this->supabase->select('sale_items', ['*'], ['financial_record_id' => "eq.{$record['id']}"]);
+            foreach ($saleItems as $si) {
+                $products = $this->supabase->select('products', ['*'], ['id' => "eq.{$si['product_id']}"], 1);
+                $product = $products[0] ?? ['name' => 'Unknown'];
+                
+                $itemObj = (object) $si;
+                $itemObj->financialRecord = (object) $record;
+                $itemObj->financialRecord->transaction_date = Carbon::parse($record['transaction_date']);
+                $itemObj->product = (object) $product;
+                $items->push($itemObj);
+            }
+        }
 
         return view('kas_keluar', compact('items'));
     }
 
     public function cashOutCreate()
     {
-        // For cash out, products might be "items to buy" or inventory. 
-        // Reusing Product model for simplicity or concept of 'Items'. 
-        // If we want separate 'ExpenseItems', we could, but 'Product' works for 'Items' generally.
-        // Let's create some dummy expense items if none exist? 
-        // OR simpler: allow free text or select from Products if it's restocking.
-        // The screenshot shows "Pilih Barang..." so it implies selecting predefined items.
-        // We'll use the same Product model for now to keep it simple, assuming 'Stock' concept later.
-        $products = \App\Models\Product::where('user_id', auth()->id())->get();
+        $userId = auth()->id();
+        $productsList = $this->supabase->select('products', ['*'], ['user_id' => "eq.{$userId}"]);
+        $products = collect($productsList)->map(fn($p) => (object) $p);
+        
         return view('tambah_pengeluaran', compact('products'));
     }
 
@@ -442,41 +536,45 @@ class FinanceController extends Controller
             return back()->withErrors(['items' => 'Mohon tambahkan setidaknya satu barang pembelian.']);
         }
 
-        $total = 0;
-        foreach ($items as $item) {
-            $total += $item['total'];
-        }
+        $total = array_sum(array_column($items, 'total'));
 
-        // Create Record
-        // Assuming all as "Cash" or just "Amount" since user removed payment method selection.
-        // We will default to storing in 'amount' and 'cash_amount' for consistency.
-        $record = \App\Models\FinancialRecord::create([
+        $record = $this->supabase->insert('financial_records', [
             'user_id' => auth()->id(),
-            'type' => 'out', // Expense
+            'type' => 'out',
             'amount' => $total,
-            'cash_amount' => $total, 
+            'cash_amount' => $total,
             'non_cash_amount' => 0,
             'transaction_date' => $request->date,
             'description' => 'Pembelian Barang'
         ]);
 
-        // Process Items
-        foreach($items as $item) {
-            // Append Unit to Name to distinguish products
-            $productName = $item['name'] . ' (' . $item['unit'] . ')';
-            
-            // Find or Create Product for tracking
-            $product = \App\Models\Product::firstOrCreate(
-                ['user_id' => auth()->id(), 'name' => $productName],
-                ['price' => $item['price']] // Default price for future reference
-            );
+        if ($record) {
+            foreach ($items as $item) {
+                $productName = $item['name'] . ' (' . $item['unit'] . ')';
+                
+                $existing = $this->supabase->select('products', ['*'], [
+                    'user_id' => "eq." . auth()->id(),
+                    'name' => "eq." . $productName
+                ], 1);
+                
+                if (empty($existing)) {
+                    $product = $this->supabase->insert('products', [
+                        'user_id' => auth()->id(),
+                        'name' => $productName,
+                        'price' => $item['price'],
+                    ]);
+                    $productId = $product['id'];
+                } else {
+                    $productId = $existing[0]['id'];
+                }
 
-            \App\Models\SaleItem::create([
-                'financial_record_id' => $record->id,
-                'product_id' => $product->id,
-                'quantity' => $item['qty'],
-                'total_price' => $item['total']
-            ]);
+                $this->supabase->insert('sale_items', [
+                    'financial_record_id' => $record['id'],
+                    'product_id' => $productId,
+                    'quantity' => $item['qty'],
+                    'total_price' => $item['total']
+                ]);
+            }
         }
 
         return redirect()->route('finance.cash-out.index');
@@ -484,67 +582,98 @@ class FinanceController extends Controller
 
     public function cashOutEdit($id)
     {
-        // For Cash Out, it's item based. We are editing the Item actually in the view list
-        // But the ID passed is likely the SaleItem ID from the view loop.
-        // Wait, the index view loops SaleItems. So $id is SaleItem id.
-        $item = \App\Models\SaleItem::whereHas('financialRecord', function($q){
-            $q->where('user_id', auth()->id());
-        })->with(['financialRecord', 'product'])->findOrFail($id);
+        $userId = auth()->id();
+        
+        $saleItems = $this->supabase->select('sale_items', ['*'], ['id' => "eq.{$id}"], 1);
+        if (empty($saleItems)) {
+            abort(404);
+        }
+        
+        $si = $saleItems[0];
+        $records = $this->supabase->select('financial_records', ['*'], ['id' => "eq.{$si['financial_record_id']}", 'user_id' => "eq.{$userId}"], 1);
+        if (empty($records)) {
+            abort(404);
+        }
+        
+        $products = $this->supabase->select('products', ['*'], ['id' => "eq.{$si['product_id']}"], 1);
+        
+        $item = (object) $si;
+        $item->financialRecord = (object) $records[0];
+        $item->financialRecord->transaction_date = Carbon::parse($records[0]['transaction_date']);
+        $item->product = (object) ($products[0] ?? ['name' => 'Unknown']);
 
-        $products = \App\Models\Product::where('user_id', auth()->id())->get();
+        $productsList = $this->supabase->select('products', ['*'], ['user_id' => "eq.{$userId}"]);
+        $allProducts = collect($productsList)->map(fn($p) => (object) $p);
 
-        return view('edit_pengeluaran', compact('item', 'products'));
+        return view('edit_pengeluaran', ['item' => $item, 'products' => $allProducts]);
     }
 
     public function cashOutUpdate(Request $request, $id)
     {
-        $item = \App\Models\SaleItem::whereHas('financialRecord', function($q){
-            $q->where('user_id', auth()->id());
-        })->findOrFail($id);
-
+        $userId = auth()->id();
+        
         $request->validate([
             'date' => 'required|date',
             'qty' => 'required|numeric|min:1',
             'price' => 'required|numeric|min:0',
         ]);
-        
-        // Update Item Details
-        $item->quantity = $request->qty;
-        $item->total_price = $request->price * $request->qty; // Re-calc total based on single price update
-        $item->save();
 
-        // Update Parent Record Total (if it was single item record, or re-sum all)
-        // Ideally we re-sum all items of that record
-        $record = $item->financialRecord;
-        $record->transaction_date = $request->date;
-        $record->amount = $record->saleItems->sum('total_price');
-        $record->cash_amount = $record->amount; // Assuming cash
-        $record->save();
+        $totalPrice = $request->price * $request->qty;
 
-        // Also update product default price?
-        // $item->product->update(['price' => $request->price]); 
+        // Update sale item
+        $this->supabase->update('sale_items', [
+            'quantity' => $request->qty,
+            'total_price' => $totalPrice,
+        ], ['id' => "eq.{$id}"]);
+
+        // Get the sale item to find the record
+        $saleItems = $this->supabase->select('sale_items', ['*'], ['id' => "eq.{$id}"], 1);
+        if (!empty($saleItems)) {
+            $recordId = $saleItems[0]['financial_record_id'];
+            
+            // Sum all items for this record
+            $allItems = $this->supabase->select('sale_items', ['total_price'], ['financial_record_id' => "eq.{$recordId}"]);
+            $newTotal = array_sum(array_column($allItems, 'total_price'));
+            
+            $this->supabase->update('financial_records', [
+                'transaction_date' => $request->date,
+                'amount' => $newTotal,
+                'cash_amount' => $newTotal,
+            ], ['id' => "eq.{$recordId}", 'user_id' => "eq.{$userId}"]);
+        }
 
         return redirect()->route('finance.cash-out.index')->with('success', 'Data pengeluaran berhasil diperbarui');
     }
 
     public function cashOutDestroy($id)
     {
-        $item = \App\Models\SaleItem::whereHas('financialRecord', function($q){
-            $q->where('user_id', auth()->id());
-        })->findOrFail($id);
-
-        $record = $item->financialRecord;
+        $userId = auth()->id();
         
-        // Delete Item
-        $item->delete();
-
-        // Check if Record has other items
-        if ($record->saleItems()->count() == 0) {
-            $record->delete();
+        // Get the sale item first
+        $saleItems = $this->supabase->select('sale_items', ['*'], ['id' => "eq.{$id}"], 1);
+        if (empty($saleItems)) {
+            abort(404);
+        }
+        
+        $recordId = $saleItems[0]['financial_record_id'];
+        
+        // Delete the sale item
+        $this->supabase->delete('sale_items', ['id' => "eq.{$id}"]);
+        
+        // Check remaining items
+        $remaining = $this->supabase->select('sale_items', ['id'], ['financial_record_id' => "eq.{$recordId}"]);
+        
+        if (empty($remaining)) {
+            // Delete the record if no items left
+            $this->supabase->delete('financial_records', ['id' => "eq.{$recordId}", 'user_id' => "eq.{$userId}"]);
         } else {
             // Update total
-            $record->amount = $record->saleItems->sum('total_price');
-            $record->save();
+            $allItems = $this->supabase->select('sale_items', ['total_price'], ['financial_record_id' => "eq.{$recordId}"]);
+            $newTotal = array_sum(array_column($allItems, 'total_price'));
+            
+            $this->supabase->update('financial_records', [
+                'amount' => $newTotal,
+            ], ['id' => "eq.{$recordId}", 'user_id' => "eq.{$userId}"]);
         }
 
         return redirect()->route('finance.cash-out.index')->with('success', 'Data pengeluaran berhasil dihapus');
@@ -553,89 +682,117 @@ class FinanceController extends Controller
     public function expenseAnalysis()
     {
         $userId = auth()->id();
-        $records = \App\Models\FinancialRecord::where('user_id', $userId)->where('type', 'out')->get();
-        $totalExpense = $records->sum('amount');
         
-        // 1. Expense Trend (Last 6 Months)
+        // Get expense records with dates
+        $expenseRecords = $this->supabase->select('financial_records', ['id', 'amount', 'transaction_date'], ['user_id' => "eq.{$userId}", 'type' => 'eq.out']);
+        $totalExpense = array_sum(array_column($expenseRecords, 'amount'));
+
+        // Monthly aggregation
         $months = [];
         $expenseData = [];
         
         for ($i = 5; $i >= 0; $i--) {
-            $date = \Carbon\Carbon::now()->subMonths($i);
-            $monthName = $date->translatedFormat('M');
+            $date = Carbon::now()->subMonths($i);
+            $months[] = $date->translatedFormat('M');
             $year = $date->year;
             $month = $date->month;
             
-            $months[] = $monthName;
-
-            $monthlyExpense = \App\Models\FinancialRecord::where('user_id', $userId)
-                ->where('type', 'out')
-                ->whereYear('transaction_date', $year)
-                ->whereMonth('transaction_date', $month)
-                ->sum('amount');
-                
-            $expenseData[] = $monthlyExpense;
+            $monthlyTotal = 0;
+            foreach ($expenseRecords as $r) {
+                $txDate = Carbon::parse($r['transaction_date']);
+                if ($txDate->year == $year && $txDate->month == $month) {
+                    $monthlyTotal += $r['amount'];
+                }
+            }
+            
+            $expenseData[] = $monthlyTotal;
         }
 
-        // 2. Top 5 Purchased Application Items
-        $topExpenses = \App\Models\SaleItem::whereHas('financialRecord', function($q) use ($userId) {
-                $q->where('user_id', $userId)->where('type', 'out');
-            })
-            ->with('product')
-            ->selectRaw('product_id, sum(quantity) as total_qty')
-            ->groupBy('product_id')
-            ->orderByDesc('total_qty')
-            ->take(5)
-            ->get();
-
-        $topExpenseLabels = $topExpenses->map(fn($item) => $item->product->name ?? 'Unknown');
-        $topExpenseData = $topExpenses->pluck('total_qty');
+        // Top Expense Items from sale_items
+        $topExpenseLabels = collect([]);
+        $topExpenseData = collect([]);
+        
+        if (!empty($expenseRecords)) {
+            $recordIds = array_column($expenseRecords, 'id');
+            $allSaleItems = [];
+            
+            foreach ($recordIds as $rid) {
+                $items = $this->supabase->select('sale_items', ['product_id', 'quantity'], ['financial_record_id' => "eq.{$rid}"]);
+                $allSaleItems = array_merge($allSaleItems, $items);
+            }
+            
+            // Group by product_id
+            $grouped = [];
+            foreach ($allSaleItems as $si) {
+                $pid = $si['product_id'];
+                if (!isset($grouped[$pid])) {
+                    $grouped[$pid] = ['product_id' => $pid, 'qty' => 0];
+                }
+                $grouped[$pid]['qty'] += $si['quantity'];
+            }
+            
+            // Sort and take top 5
+            usort($grouped, fn($a, $b) => $b['qty'] <=> $a['qty']);
+            $top5 = array_slice($grouped, 0, 5);
+            
+            foreach ($top5 as $item) {
+                $products = $this->supabase->select('products', ['name'], ['id' => "eq.{$item['product_id']}"], 1);
+                $topExpenseLabels->push($products[0]['name'] ?? 'Unknown');
+                $topExpenseData->push($item['qty']);
+            }
+        }
 
         return view('analisis_pengeluaran', compact(
-            'totalExpense', 
-            'months', 
-            'expenseData',
-            'topExpenseLabels',
-            'topExpenseData'
+            'totalExpense', 'months', 'expenseData',
+            'topExpenseLabels', 'topExpenseData'
         ));
     }
-
 
     public function profile()
     {
         return view('profile_pengguna');
     }
+
     public function updateProfile(Request $request)
     {
         $user = auth()->user();
+        $userId = $user->id;
 
         $request->validate([
             'name' => 'required|string|max:255',
-            'username' => 'required|string|max:255|unique:users,username,'.$user->id,
-            'email' => 'required|email|max:255|unique:users,email,'.$user->id,
+            'username' => 'required|string|max:255',
+            'email' => 'required|email|max:255',
             'photo' => 'nullable|image|mimes:jpeg,png,jpg,gif|max:2048',
             'password' => 'nullable|min:6',
         ]);
 
-        $user->name = $request->name;
-        $user->username = $request->username;
-        $user->email = $request->email;
+        // Check unique email/username via Supabase
+        $existingEmail = $this->supabase->select('users', ['id'], ['email' => "eq.{$request->email}"]);
+        if (!empty($existingEmail) && $existingEmail[0]['id'] != $userId) {
+            return back()->withErrors(['email' => 'Email sudah digunakan.']);
+        }
+
+        $existingUsername = $this->supabase->select('users', ['id'], ['username' => "eq.{$request->username}"]);
+        if (!empty($existingUsername) && $existingUsername[0]['id'] != $userId) {
+            return back()->withErrors(['username' => 'Username sudah digunakan.']);
+        }
+
+        $updateData = [
+            'name' => $request->name,
+            'username' => $request->username,
+            'email' => $request->email,
+        ];
 
         if ($request->filled('password')) {
-            $user->password = \Illuminate\Support\Facades\Hash::make($request->password);
+            $updateData['password'] = Hash::make($request->password);
         }
 
         if ($request->hasFile('photo')) {
-            // Delete old photo if exists
-            if ($user->profile_photo && \Illuminate\Support\Facades\Storage::exists('public/' . $user->profile_photo)) {
-                \Illuminate\Support\Facades\Storage::delete('public/' . $user->profile_photo);
-            }
-            
             $path = $request->file('photo')->store('profile_photos', 'public');
-            $user->profile_photo = $path;
+            $updateData['profile_photo'] = $path;
         }
 
-        $user->save();
+        $this->supabase->update('users', $updateData, ['id' => "eq.{$userId}"]);
 
         return back()->with('success', 'Profil berhasil diperbarui!');
     }

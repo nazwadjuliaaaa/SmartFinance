@@ -72,8 +72,6 @@
                 @endforelse
             </tbody>
         </table>
-        <div style="padding: 10px;">
-            {{ $transactions->links() }}
-        </div>
+        {{-- Pagination removed for Supabase integration --}}
     </div>
 @endsection

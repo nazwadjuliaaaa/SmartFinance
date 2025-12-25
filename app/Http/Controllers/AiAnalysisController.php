@@ -4,17 +4,18 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use App\Services\GeminiFinanceService;
+use App\Services\SupabaseService;
 use Illuminate\Support\Facades\Auth;
-use App\Models\BusinessStrategy;
-use App\Models\FinancialRecord;
 
 class AiAnalysisController extends Controller
 {
-    protected $geminiService;
+    protected GeminiFinanceService $geminiService;
+    protected SupabaseService $supabase;
 
-    public function __construct(GeminiFinanceService $geminiService)
+    public function __construct(GeminiFinanceService $geminiService, SupabaseService $supabase)
     {
         $this->geminiService = $geminiService;
+        $this->supabase = $supabase;
     }
 
     public function index()
@@ -24,8 +25,7 @@ class AiAnalysisController extends Controller
 
     public function specificAnalysis(Request $request)
     {
-        // For feature-specific requests (e.g. "Explain this chart")
-        // Not implemented in MVP, but good to have the hook
+        // Not implemented in MVP
     }
 
     public function getAnalysis()
@@ -51,57 +51,80 @@ class AiAnalysisController extends Controller
     public function getStrategy()
     {
         $user = Auth::user();
+        $userId = $user->id;
         
-        // 1. Calculate Current Net Profit (same logic as Service)
-        $revenue = FinancialRecord::where('user_id', $user->id)->where('type', 'in')->sum('amount');
-        $expense = FinancialRecord::where('user_id', $user->id)->where('type', 'out')->sum('amount');
+        // 1. Calculate Current Net Profit via Supabase
+        $incomeRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.in']);
+        $expenseRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.out']);
+        
+        $revenue = array_sum(array_column($incomeRecords, 'amount'));
+        $expense = array_sum(array_column($expenseRecords, 'amount'));
         $currentProfit = $revenue - $expense;
 
-        // 2. Check for latest strategy
-        $latestStrategy = BusinessStrategy::where('user_id', $user->id)
-            ->whereIn('status', ['active', 'accepted'])
-            ->latest()
-            ->first();
-
-        // 3. Logic for Reuse
-        if ($latestStrategy) {
-            // If user has accepted this strategy, we keep showing it until they explicitly request a new one
-            if ($latestStrategy->status === 'accepted') {
-                return response()->json(array_merge($latestStrategy->strategy_content, ['status' => 'accepted']));
-            }
-            
-            // If profit hasn't changed significantly (exact match for now), reuse it
-            // Note: in floating point, exact match might be risky, but for currency it's usually fine or we use ranges. 
-            // Let's use exact match for simple MVP string comparison after format, or just abs diff < 1000
-            if (abs($latestStrategy->based_on_profit - $currentProfit) < 1000) {
-                 return response()->json(array_merge($latestStrategy->strategy_content, ['status' => 'active']));
+        // 2. Check for latest strategy via Supabase
+        $strategies = $this->supabase->select('business_strategies', ['*'], ['user_id' => "eq.{$userId}"]);
+        
+        // Filter active or accepted strategies
+        $latestStrategy = null;
+        foreach ($strategies as $s) {
+            if (in_array($s['status'], ['active', 'accepted'])) {
+                if (!$latestStrategy || $s['id'] > $latestStrategy['id']) {
+                    $latestStrategy = $s;
+                }
             }
         }
 
-        // 4. Generate New (if no strategy exists, or profit changed)
+        // 3. Logic for Reuse
+        if ($latestStrategy) {
+            $strategyContent = is_string($latestStrategy['strategy_content']) 
+                ? json_decode($latestStrategy['strategy_content'], true) 
+                : $latestStrategy['strategy_content'];
+            
+            if ($latestStrategy['status'] === 'accepted') {
+                return response()->json(array_merge($strategyContent, ['status' => 'accepted']));
+            }
+            
+            if (abs($latestStrategy['based_on_profit'] - $currentProfit) < 1000) {
+                return response()->json(array_merge($strategyContent, ['status' => 'active']));
+            }
+        }
+
+        // 4. Generate New
         return $this->generateAndSaveStrategy($user, $currentProfit);
     }
 
     public function regenerateStrategy()
     {
         $user = Auth::user();
+        $userId = $user->id;
         
-        // Calculate Profit
-        $revenue = FinancialRecord::where('user_id', $user->id)->where('type', 'in')->sum('amount');
-        $expense = FinancialRecord::where('user_id', $user->id)->where('type', 'out')->sum('amount');
+        $incomeRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.in']);
+        $expenseRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.out']);
+        
+        $revenue = array_sum(array_column($incomeRecords, 'amount'));
+        $expense = array_sum(array_column($expenseRecords, 'amount'));
         $currentProfit = $revenue - $expense;
 
-        // Force generate new
         return $this->generateAndSaveStrategy($user, $currentProfit);
     }
 
     public function acceptStrategy()
     {
         $user = Auth::user();
-        $latestStrategy = BusinessStrategy::where('user_id', $user->id)->latest()->first();
+        $userId = $user->id;
+        
+        $strategies = $this->supabase->select('business_strategies', ['*'], ['user_id' => "eq.{$userId}"]);
+        
+        // Find latest
+        $latestStrategy = null;
+        foreach ($strategies as $s) {
+            if (!$latestStrategy || $s['id'] > $latestStrategy['id']) {
+                $latestStrategy = $s;
+            }
+        }
 
         if ($latestStrategy) {
-            $latestStrategy->update(['status' => 'accepted']);
+            $this->supabase->update('business_strategies', ['status' => 'accepted'], ['id' => "eq.{$latestStrategy['id']}"]);
             return response()->json(['message' => 'Strategy accepted']);
         }
 
@@ -112,15 +135,14 @@ class AiAnalysisController extends Controller
     {
         $strategyData = $this->geminiService->analyzeBusinessStrategy($user);
         
-        // Check if API failed
         if (isset($strategyData['error'])) {
             return response()->json($strategyData);
         }
 
-        // Save to DB
-        BusinessStrategy::create([
+        // Save to Supabase
+        $this->supabase->insert('business_strategies', [
             'user_id' => $user->id,
-            'strategy_content' => $strategyData,
+            'strategy_content' => json_encode($strategyData),
             'based_on_profit' => $profit,
             'status' => 'active'
         ]);

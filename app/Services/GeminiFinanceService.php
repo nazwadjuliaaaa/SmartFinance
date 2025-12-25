@@ -2,20 +2,19 @@
 
 namespace App\Services;
 
-use App\Models\FinancialRecord;
-use App\Models\FinancialInitial;
-use App\Models\SaleItem;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 
 class GeminiFinanceService
 {
-    protected $baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent';
+    protected $baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
     protected $apiKey;
+    protected SupabaseService $supabase;
 
-    public function __construct()
+    public function __construct(SupabaseService $supabase)
     {
         $this->apiKey = env('GEMINI_API_KEY');
+        $this->supabase = $supabase;
     }
 
     /**
@@ -52,50 +51,56 @@ class GeminiFinanceService
     }
 
     /**
-     * Gather all relevant financial data into a structured array
+     * Gather all relevant financial data via Supabase REST API
      */
     protected function aggregateData($user)
     {
-        // 1. Initial Data
-        $initial = FinancialInitial::where('user_id', $user->id)->first();
+        $userId = $user->id;
+
+        // 1. Initial Data from Supabase
+        $initials = $this->supabase->select('financial_initials', ['*'], ['user_id' => "eq.{$userId}"], 1);
+        $initial = $initials[0] ?? null;
         
-        // 2. Transactions (Last 30 days)
-        $records = FinancialRecord::where('user_id', $user->id)
-            ->where('transaction_date', '>=', now()->subDays(60)) // Get 2 months for trend comparison
-            ->get();
+        // 2. Transactions from Supabase
+        $incomeRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.in']);
+        $expenseRecords = $this->supabase->select('financial_records', ['amount'], ['user_id' => "eq.{$userId}", 'type' => 'eq.out']);
+        
+        $cashInTotal = array_sum(array_column($incomeRecords, 'amount'));
+        $cashOutTotal = array_sum(array_column($expenseRecords, 'amount'));
 
-        $income = $records->where('type', 'income');
-        $expense = $records->where('type', 'expense');
-
-        // 3. Sales Data
-        $saleItems = SaleItem::with('product')
-            ->whereHas('financialRecord', function ($q) use ($user) {
-                $q->where('user_id', $user->id);
-            })
-            ->get();
-
-        $topProducts = $saleItems->groupBy('product_id')
-            ->map(function ($items) {
-                return [
-                    'name' => $items->first()->product->name ?? 'Unknown',
-                    'total_sold' => $items->sum('quantity'),
-                    'total_revenue' => $items->sum('total_price'),
-                ];
-            })
-            ->sortByDesc('total_revenue')
-            ->take(5);
+        // 3. Top Products (simplified - just fetch products sold)
+        $topProducts = [];
+        $saleItems = $this->supabase->select('sale_items', ['product_id', 'quantity', 'total_price']);
+        if (!empty($saleItems)) {
+            $grouped = [];
+            foreach ($saleItems as $si) {
+                $pid = $si['product_id'];
+                if (!isset($grouped[$pid])) {
+                    $grouped[$pid] = ['product_id' => $pid, 'total_sold' => 0, 'total_revenue' => 0];
+                }
+                $grouped[$pid]['total_sold'] += $si['quantity'];
+                $grouped[$pid]['total_revenue'] += $si['total_price'];
+            }
+            
+            // Get product names
+            foreach ($grouped as $pid => &$item) {
+                $products = $this->supabase->select('products', ['name'], ['id' => "eq.{$pid}"], 1);
+                $item['name'] = $products[0]['name'] ?? 'Unknown';
+            }
+            
+            usort($grouped, fn($a, $b) => $b['total_revenue'] <=> $a['total_revenue']);
+            $topProducts = array_slice($grouped, 0, 5);
+        }
 
         return [
-            'initial_capital' => $initial->starting_capital ?? 0,
-            'current_assets' => $initial->fixed_assets ?? [],
-            'cash_in_total' => $income->sum('amount'),
-            'cash_out_total' => $expense->sum('amount'),
-            'cash_in_trends' => $income->groupBy('transaction_date')->map->sum('amount'),
-            'cash_out_trends' => $expense->groupBy('transaction_date')->map->sum('amount'),
+            'initial_capital' => $initial['starting_capital'] ?? 0,
+            'current_assets' => $initial['fixed_assets'] ?? [],
+            'cash_in_total' => $cashInTotal,
+            'cash_out_total' => $cashOutTotal,
+            'cash_in_trends' => [],
+            'cash_out_trends' => [],
             'top_products' => $topProducts,
-            'recent_expenses' => $expense->take(10)->map(function ($r) {
-                return "{$r->transaction_date->format('Y-m-d')}: {$r->description} ({$r->amount})";
-            })->implode("\n"),
+            'recent_expenses' => '',
         ];
     }
 
@@ -119,7 +124,6 @@ class GeminiFinanceService
         - Total Pemasukan (60 Hari): Rp " . number_format($data['cash_in_total']) . "
         - Total Pengeluaran (60 Hari): Rp " . number_format($data['cash_out_total']) . "
         - Produk Terlaris: " . json_encode($data['top_products']) . "
-        - Pengeluaran Terakhir: \n" . $data['recent_expenses'] . "
         ";
     }
 
@@ -202,7 +206,7 @@ class GeminiFinanceService
                     return ['error' => '⏳ Kuota AI habis sementara. Mohon tunggu 1-2 menit sebelum mencoba lagi.'];
                 }
                 Log::error('Gemini API Error: ' . $response->body());
-                return ['error' => 'Gagal menghubungi AI. Cek log/API Key.'];
+                return ['error' => 'Maaf, terjadi kesalahan koneksi.'];
             }
 
             $result = $response->json();
@@ -213,16 +217,17 @@ class GeminiFinanceService
             $jsonEnd = strrpos($text, '}');
             if ($jsonStart !== false && $jsonEnd !== false) {
                 $jsonStr = substr($text, $jsonStart, $jsonEnd - $jsonStart + 1);
-                return json_decode($jsonStr, true) ?? ['text' => $text]; // Fallback to raw text if decode fails
+                return json_decode($jsonStr, true) ?? ['text' => $text];
             }
 
-            return ['text' => $text]; // Return raw text for reports
+            return ['text' => $text];
 
         } catch (\Exception $e) {
             Log::error('Gemini Service Exception: ' . $e->getMessage());
-            return ['error' => 'Terjadi kesalahan sistem.'];
+            return ['error' => 'Maaf, terjadi kesalahan koneksi.'];
         }
     }
+
     /**
      * Analyze Business Strategy based on Net Profit
      */
