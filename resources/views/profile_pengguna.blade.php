@@ -70,6 +70,14 @@
                     </p>
                 </div>
             </form>
+            </form>
+
+            <div style="text-align: center; margin-top: 30px; border-top: 1px dashed #cbd5e1; padding-top: 20px;">
+                <p style="color: #64748b; font-size: 0.9rem; margin-bottom: 15px;">Ingin mengubah data modal atau aset?</p>
+                <a href="{{ route('finance.initial') }}" style="display: inline-block; padding: 10px 25px; background: white; color: var(--primary-color); border: 1px solid var(--primary-color); border-radius: 8px; text-decoration: none; font-weight: 600; transition: all 0.3s;">
+                    ⚙️ Edit Data Keuangan Awal
+                </a>
+            </div>
         </div>
     </div>
 @endsection

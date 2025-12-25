@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Log;
 
 class GeminiFinanceService
 {
-    protected $baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent';
+    protected $baseUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent';
     protected $apiKey;
 
     public function __construct()
@@ -37,6 +37,17 @@ class GeminiFinanceService
         $context = $this->aggregateData($user);
         $prompt = $this->buildReportPrompt($context, $period);
         
+        return $this->callGemini($prompt);
+    }
+
+    /**
+     * Handle general chat with financial context
+     */
+    public function chat($userMessage, $user)
+    {
+        $context = $this->aggregateData($user);
+        $prompt = $this->buildChatPrompt($userMessage, $context);
+
         return $this->callGemini($prompt);
     }
 
@@ -126,6 +137,46 @@ class GeminiFinanceService
         4. Kesimpulan Kesehatan Keuangan
 
         DATA: " . json_encode($data);
+    }
+
+    /**
+     * Construct the prompt for chat
+     */
+    protected function buildChatPrompt($userMessage, $data)
+    {
+        $financialSummary = "
+        - Modal Awal: Rp " . number_format($data['initial_capital'], 0, ',', '.') . "
+        - Total Pemasukan: Rp " . number_format($data['cash_in_total'], 0, ',', '.') . "
+        - Total Pengeluaran: Rp " . number_format($data['cash_out_total'], 0, ',', '.') . "
+        - Keuntungan Bersih: Rp " . number_format($data['cash_in_total'] - $data['cash_out_total'], 0, ',', '.') . "
+        - Produk Terlaris: " . json_encode($data['top_products']) . "
+        ";
+
+        return "
+        Kamu adalah 'SmartAssistant', asisten keuangan cerdas dari aplikasi SmartFinance.
+        
+        PERAN KAMU:
+        Sebagai konsultan keuangan pribadi yang ramah, profesional, dan solutif. Kamu membantu pengguna memahami kondisi keuangan mereka, memberikan saran bisnis, dan menjawab pertanyaan seputar ekonomi.
+
+        DATA KEUANGAN PENGGUNA (Gunakan ini sebagai konteks):
+        {$financialSummary}
+
+        INSTRUKSI KHUSUS:
+        1.  **Gaya Bicara**: Natural, seperti manusia, empatik, dan tidak kaku. Jangan memberi jawaban seperti robot.
+        2.  **Topik**: Jawab SEMUA pertanyaan yang berkaitan dengan:
+            - Analisis data keuangan pengguna (misalnya: 'Apakah saya untung?', 'Bagaimana kondisi keuanganku?').
+            - Tips bisnis dan manajemen keuangan (misalnya: 'Cara meningkatkan omzet', 'Tips hemat').
+            - Pengetahuan umum ekonomi dan investasi.
+        3.  **Larangan**:
+            - JANGAN menjawab pertanyaan di luar topik keuangan (misalnya: resep masakan, rekomendasi film, politik).
+            - Jika ditanya hal di luar topik, tolak dengan sopan dan jenaka, lalu arahkan kembali ke keuangan. Contoh: 'Waduh, saya kurang jago soal masak. Tapi kalau soal 'meracik' keuntungan bisnis, saya ahlinya! Ada yang mau ditanyakan soal keuanganmu?'
+        4.  **Tanpa Kata Kunci**: Pengguna TIDAK perlu mengetik kata kunci khusus seperti 'analisis' atau 'tips'. Pahami maksud mereka dari kalimat biasa.
+        
+        PERTANYAAN PENGGUNA:
+        '{$userMessage}'
+
+        JAWABAN (Langsung berikan jawaban terbaikmu dalam Bahasa Indonesia):
+        ";
     }
 
     /**
