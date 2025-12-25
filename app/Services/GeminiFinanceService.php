@@ -198,6 +198,9 @@ class GeminiFinanceService
             ]);
 
             if ($response->failed()) {
+                if ($response->status() == 429) {
+                    return ['error' => '⏳ Kuota AI habis sementara. Mohon tunggu 1-2 menit sebelum mencoba lagi.'];
+                }
                 Log::error('Gemini API Error: ' . $response->body());
                 return ['error' => 'Gagal menghubungi AI. Cek log/API Key.'];
             }
@@ -219,5 +222,36 @@ class GeminiFinanceService
             Log::error('Gemini Service Exception: ' . $e->getMessage());
             return ['error' => 'Terjadi kesalahan sistem.'];
         }
+    }
+    /**
+     * Analyze Business Strategy based on Net Profit
+     */
+    public function analyzeBusinessStrategy($user)
+    {
+        $context = $this->aggregateData($user);
+        $netProfit = $context['cash_in_total'] - $context['cash_out_total'];
+        $context['net_profit'] = $netProfit;
+
+        $prompt = "
+        Bertindaklah sebagai Konsultan Strategi Bisnis Senior.
+        Analisis data keuangan berikut untuk memberikan strategi bisnis yang konkret.
+
+        DATA KEUANGAN:
+        - Total Pemasukan: Rp " . number_format($context['cash_in_total'], 0, ',', '.') . "
+        - Total Pengeluaran: Rp " . number_format($context['cash_out_total'], 0, ',', '.') . "
+        - Keuntungan Bersih (Omzet Bersih): Rp " . number_format($netProfit, 0, ',', '.') . "
+        - Produk Terlaris: " . json_encode($context['top_products']) . "
+
+        TUGAS:
+        Berikan analisis dalam format JSON berikut:
+        {
+            'defense_strategy': 'Strategi untuk mempertahankan dan memaksimalkan bisnis saat ini berdasarkan produk terlaris dan margin saat ini.',
+            'expansion_recommendation': 'Rekomendasi ide bisnis BARU atau ekspansi yang cocok dilakukan dengan modal dari keuntungan bersih saat ini (sebutkan estimasi modalnya).'
+        }
+
+        Pastikan sarannya praktis, masuk akal untuk skala UMKM, dan langsung pada intinya.
+        ";
+
+        return $this->callGemini($prompt);
     }
 }

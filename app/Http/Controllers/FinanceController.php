@@ -282,6 +282,66 @@ class FinanceController extends Controller
         return redirect()->route('finance.cash-in.index');
     }
 
+    public function cashInEdit($id)
+    {
+        $record = \App\Models\FinancialRecord::where('user_id', auth()->id())->findOrFail($id);
+        $products = \App\Models\Product::where('user_id', auth()->id())->get();
+        // Assume single item editing for now as per previous simple logic, or load items
+        // For simple edit, we just allow editing total amount and date if it wasn't itemized detailedly in UI
+        // But since we have items, we should ideally load them. 
+        // For MVP speed, let's allow editing the main Record details.
+        
+        return view('edit_pemasukan', compact('record', 'products'));
+    }
+
+    public function cashInUpdate(Request $request, $id)
+    {
+        $record = \App\Models\FinancialRecord::where('user_id', auth()->id())->findOrFail($id);
+
+        // Sanitize
+        $cleanCash = str_replace('.', '', $request->amount_cash);
+        $cleanNonCash = str_replace('.', '', $request->amount_non_cash);
+
+        $request->merge([
+            'amount_cash' => $cleanCash,
+            'amount_non_cash' => $cleanNonCash
+        ]);
+
+        $request->validate([
+            'date' => 'required|date',
+            'amount_cash' => 'nullable|numeric',
+            'amount_non_cash' => 'nullable|numeric',
+        ]);
+
+        $cash = $request->amount_cash ?? 0;
+        $nonCash = $request->amount_non_cash ?? 0;
+        $total = $cash + $nonCash;
+
+        $record->update([
+            'transaction_date' => $request->date,
+            'amount' => $total,
+            'cash_amount' => $cash,
+            'non_cash_amount' => $nonCash,
+        ]);
+
+        // Note: Updating specific items is complex in this UI flow. 
+        // If users want to change items, they might need to delete and re-add or we build a complex JS edit.
+        // For now, updating the total allows fixing mistakes.
+        
+        return redirect()->route('finance.cash-in.index')->with('success', 'Data berhasil diperbarui');
+    }
+
+    public function cashInDestroy($id)
+    {
+        $record = \App\Models\FinancialRecord::where('user_id', auth()->id())->findOrFail($id);
+        
+        // Items will auto-delete if cascade on delete is set in DB, else:
+        \App\Models\SaleItem::where('financial_record_id', $record->id)->delete();
+        $record->delete();
+
+        return redirect()->route('finance.cash-in.index')->with('success', 'Data berhasil dihapus');
+    }
+
     public function salesAnalysis()
     {
         $userId = auth()->id();
@@ -420,6 +480,74 @@ class FinanceController extends Controller
         }
 
         return redirect()->route('finance.cash-out.index');
+    }
+
+    public function cashOutEdit($id)
+    {
+        // For Cash Out, it's item based. We are editing the Item actually in the view list
+        // But the ID passed is likely the SaleItem ID from the view loop.
+        // Wait, the index view loops SaleItems. So $id is SaleItem id.
+        $item = \App\Models\SaleItem::whereHas('financialRecord', function($q){
+            $q->where('user_id', auth()->id());
+        })->with(['financialRecord', 'product'])->findOrFail($id);
+
+        $products = \App\Models\Product::where('user_id', auth()->id())->get();
+
+        return view('edit_pengeluaran', compact('item', 'products'));
+    }
+
+    public function cashOutUpdate(Request $request, $id)
+    {
+        $item = \App\Models\SaleItem::whereHas('financialRecord', function($q){
+            $q->where('user_id', auth()->id());
+        })->findOrFail($id);
+
+        $request->validate([
+            'date' => 'required|date',
+            'qty' => 'required|numeric|min:1',
+            'price' => 'required|numeric|min:0',
+        ]);
+        
+        // Update Item Details
+        $item->quantity = $request->qty;
+        $item->total_price = $request->price * $request->qty; // Re-calc total based on single price update
+        $item->save();
+
+        // Update Parent Record Total (if it was single item record, or re-sum all)
+        // Ideally we re-sum all items of that record
+        $record = $item->financialRecord;
+        $record->transaction_date = $request->date;
+        $record->amount = $record->saleItems->sum('total_price');
+        $record->cash_amount = $record->amount; // Assuming cash
+        $record->save();
+
+        // Also update product default price?
+        // $item->product->update(['price' => $request->price]); 
+
+        return redirect()->route('finance.cash-out.index')->with('success', 'Data pengeluaran berhasil diperbarui');
+    }
+
+    public function cashOutDestroy($id)
+    {
+        $item = \App\Models\SaleItem::whereHas('financialRecord', function($q){
+            $q->where('user_id', auth()->id());
+        })->findOrFail($id);
+
+        $record = $item->financialRecord;
+        
+        // Delete Item
+        $item->delete();
+
+        // Check if Record has other items
+        if ($record->saleItems()->count() == 0) {
+            $record->delete();
+        } else {
+            // Update total
+            $record->amount = $record->saleItems->sum('total_price');
+            $record->save();
+        }
+
+        return redirect()->route('finance.cash-out.index')->with('success', 'Data pengeluaran berhasil dihapus');
     }
 
     public function expenseAnalysis()

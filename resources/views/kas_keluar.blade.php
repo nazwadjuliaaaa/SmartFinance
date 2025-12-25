@@ -13,7 +13,7 @@
     <a href="{{ route('finance.cash-out.create') }}" class="btn-green" style="margin-bottom: 20px; padding: 10px 20px; display:inline-block;">Tambah Pengeluaran</a>
 
     <div class="recap-container" style="max-width: 100%;">
-        <div class="table-header" style="grid-template-columns: 0.5fr 1.2fr 2fr 1.5fr 0.8fr 1fr 1.5fr;">
+        <div class="table-header" style="grid-template-columns: 0.5fr 1.2fr 2fr 1.5fr 0.8fr 1fr 1.5fr 1fr;">
             <div>No</div>
             <div>Tanggal</div>
             <div>Nama Barang</div>
@@ -21,6 +21,7 @@
             <div>Jumlah</div>
             <div>Satuan</div>
             <div>Total</div>
+            <div style="text-align: center;">Aksi</div>
         </div>
         
         @foreach($items as $index => $item)
@@ -34,7 +35,7 @@
                 }
                 $pricePerUnit = $item->quantity > 0 ? $item->total_price / $item->quantity : 0;
             @endphp
-        <div class="table-row" style="grid-template-columns: 0.5fr 1.2fr 2fr 1.5fr 0.8fr 1fr 1.5fr;">
+        <div class="table-row" style="grid-template-columns: 0.5fr 1.2fr 2fr 1.5fr 0.8fr 1fr 1.5fr 1fr;">
             <div>{{ $index + 1 }}</div>
             <div>{{ $item->financialRecord->transaction_date->format('d/m/Y') }}</div>
             <div>{{ $name }}</div>
@@ -42,6 +43,15 @@
             <div>{{ $item->quantity }}</div>
             <div>{{ $unit }}</div>
             <div>Rp{{ number_format($item->total_price, 0, ',', '.') }}</div>
+            <div style="display: flex; gap: 5px; justify-content: center;">
+                <a href="{{ route('finance.cash-out.edit', $item->id) }}" style="text-decoration: none; background: #fbbf24; color: white; padding: 5px 8px; border-radius: 5px; font-size: 0.8rem;">✏️</a>
+                
+                <form action="{{ route('finance.cash-out.destroy', $item->id) }}" method="POST" onsubmit="return confirm('Apakah Anda yakin ingin menghapus data pengeluaran ini?');" style="display: inline;">
+                    @csrf
+                    @method('DELETE')
+                    <button type="submit" style="background: #ef4444; color: white; border: none; padding: 5px 8px; border-radius: 5px; font-size: 0.8rem; cursor: pointer;">🗑️</button>
+                </form>
+            </div>
         </div>
         @endforeach
 
